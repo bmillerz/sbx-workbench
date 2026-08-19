@@ -66,7 +66,9 @@ Images are arm64-only — add `docker buildx --platform linux/amd64,linux/arm64
 ## Gotchas
 
 - **No init in a sandbox** — apt installs are installed-but-stopped. That's what `devup` is for.
-- **Serve on `--host=[::]`** — binds both stacks; 127.0.0.1 inside is unreachable.
+- **Serve on `[::]`, not `0.0.0.0`** — 127.0.0.1 inside is unreachable, and macOS resolves
+  `localhost` to `::1` first. Laravel: set `SERVER_HOST: "[::]"` in the env file — `artisan
+  serve` reads it, so composer.json stays stock.
 - **DB creds** — `DB_HOST=127.0.0.1`, `DB_USERNAME=agent`, empty password.
 - **`node_modules` is bind-mounted** — `npm ci` inside overwrites the host's copy with Linux builds. `workspace: {path: ., clone: true}` avoids it.
 - **Never run `npx playwright install`** — chromium is already at `/opt/playwright`, on `PATH` as `chromium`.
