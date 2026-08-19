@@ -27,6 +27,8 @@ sandboxOptions:
 ports:
   - sandbox: 8000
     host: 8000
+  - sandbox: 5173
+    host: 5173
 secrets:
   STRIPE_SECRET:
     ref: op://Vault/my-project/stripe-secret
@@ -39,7 +41,7 @@ sbx env rm                   # tear down, including scoped secrets
 ```
 
 Inside a fresh sandbox: `npm ci`, then `createdb <name> && php artisan migrate`,
-then `php artisan serve --host 0.0.0.0 --port 8000`.
+then `php artisan serve --host=[::] --port=8000`.
 
 ## Publish
 
@@ -57,20 +59,14 @@ Kit tags must match the spec's `version:` — separate strings, nothing syncs th
 **Bump tags, never rebuild in place.** A host that pulled `:v1` keeps its cached
 copy and silently runs the old image.
 
+Images are arm64-only — add `docker buildx --platform linux/amd64,linux/arm64
+--push` if an Intel host needs one. Built with Docker rather than
+`sbx template save`, which is broken on v0.38.0 (ext4 tar bug).
+
 ## Gotchas
 
-- **No init in a sandbox** — everything apt installs is installed-but-stopped.
-That's what `devup` is for.
-- **Serve on `--host 0.0.0.0`** — 127.0.0.1 inside is unreachable even when the
-port is published.
-- **The DB starts empty** and isn't the host's Postgres. `.env` wants
-`DB_HOST=127.0.0.1`, `DB_USERNAME=agent`, empty password.
-- `**node_modules` is bind-mounted** — `npm ci` inside overwrites the host's copy
-with Linux builds. `workspace: {path: ., clone: true}` avoids it.
-- **The workspace is the host's real files** unless `clone: true`.
-- **Never run `npx playwright install`** — chromium is already at
-`PLAYWRIGHT_BROWSERS_PATH=/opt/playwright`, on `PATH` as `chromium`.
-- **Images are arm64-only.** `docker buildx --platform linux/amd64,linux/arm64 --push` if an Intel host needs one.
-- `**sbx env`/`sbx kit` are experimental** and `sbx template save` is broken on
-v0.38.0 (ext4 tar bug) — hence building with Docker.
-
+- **No init in a sandbox** — apt installs are installed-but-stopped. That's what `devup` is for.
+- **Serve on `--host=[::]`** — binds both stacks; 127.0.0.1 inside is unreachable.
+- **DB creds** — `DB_HOST=127.0.0.1`, `DB_USERNAME=agent`, empty password.
+- **`node_modules` is bind-mounted** — `npm ci` inside overwrites the host's copy with Linux builds. `workspace: {path: ., clone: true}` avoids it.
+- **Never run `npx playwright install`** — chromium is already at `/opt/playwright`, on `PATH` as `chromium`.
