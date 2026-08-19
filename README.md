@@ -5,6 +5,7 @@ Both publish to Docker Hub, so a project needs only a committed `.sbxenv.yaml`.
 
 ```
 templates/workbench-laravel/   PHP 8.5, Postgres, Redis, sqlite, node 22, gh, chromium
+templates/workbench-wordpress/ PHP 8.5, MariaDB, Apache, wp-cli, node 22, gh, chromium
 kits/claude-config/            global CLAUDE.md, statusline, plugins
 kits/devup/                    starts the services the image ships stopped
 ```
@@ -29,6 +30,8 @@ ports:
     host: 8000
   - sandbox: 5173
     host: 5173
+env:
+  SERVER_HOST: "[::]"
 secrets:
   STRIPE_SECRET:
     ref: op://Vault/my-project/stripe-secret
@@ -40,8 +43,12 @@ sbx env exec -it -- bash     # second shell
 sbx env rm                   # tear down, including scoped secrets
 ```
 
-Inside a fresh sandbox: `npm ci`, then `createdb <name> && php artisan migrate`,
-then `php artisan serve --host=[::] --port=8000`.
+Inside a fresh Laravel sandbox: `npm ci`, then `createdb <name> && php artisan migrate`,
+then `composer dev` — `SERVER_HOST` above makes it bind dual-stack.
+
+WordPress serves over Apache on port 80, so publish `sandbox: 80` and point the
+docroot at the project once inside: `sudo ln -sfn "$PWD" /var/www/html`. Import a
+dump with `sbx cp` then `wp db import`, and fix URLs with `wp search-replace`.
 
 ## Publish
 
