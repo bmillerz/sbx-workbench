@@ -1,0 +1,151 @@
+schemaVersion: "2"
+kind: mixin
+name: claude-config
+version: "1.0.0"
+displayName: Claude Code config
+description: Carries the host's statusline, plugins, prefs and global CLAUDE.md into a sandbox.
+
+setup:
+  files:
+    - path: /home/agent/.claude/CLAUDE.md
+      mode: "0644"
+      description: Global communication-style instructions
+      content: |
+        ## Communication style
+        
+        - Be anti-sycophantic — don't fold arguments just because I push back
+        - Stop excessive validation — challenge my reasoning instead
+        - Avoid flattery that feels like unnecessary praise
+        - Don't anthropomorphize yourself
+        - Skip the "Great question!" and "Certainly!" openers
+    - path: /home/agent/.config/ccstatusline/settings.json
+      mode: "0644"
+      description: ccstatusline layout (git branch, model, context %, usage, reset timer)
+      content: |
+        {
+          "version": 3,
+          "lines": [
+            [
+              {
+                "id": "f6cbcc28-d3bd-4d6f-b131-fb94afd32e8b",
+                "type": "git-branch"
+              },
+              {
+                "id": "2b663125-e592-4610-8f3b-e485b8333134",
+                "type": "separator"
+              },
+              {
+                "id": "1",
+                "type": "model",
+                "color": "magenta",
+                "rawValue": true
+              },
+              {
+                "id": "2",
+                "type": "separator"
+              },
+              {
+                "id": "3",
+                "type": "context-percentage",
+                "color": "blue",
+                "rawValue": true
+              },
+              {
+                "id": "4",
+                "type": "separator"
+              },
+              {
+                "id": "5",
+                "type": "session-usage",
+                "color": "cyan",
+                "rawValue": true
+              },
+              {
+                "id": "6",
+                "type": "separator"
+              },
+              {
+                "id": "7",
+                "type": "reset-timer",
+                "color": "yellow",
+                "rawValue": true
+              }
+            ],
+            [],
+            []
+          ],
+          "flexMode": "full-minus-40",
+          "compactThreshold": 60,
+          "colorLevel": 2,
+          "inheritSeparatorColors": false,
+          "globalBold": false,
+          "powerline": {
+            "enabled": false,
+            "separators": [
+              ""
+            ],
+            "separatorInvertBackground": [
+              false
+            ],
+            "startCaps": [],
+            "endCaps": [],
+            "autoAlign": false
+          }
+        }
+    - path: /home/agent/.claude/host-settings.json
+      mode: "0644"
+      description: Portable subset of the host settings.json, merged in at startup
+      content: |
+        {
+          "statusLine": {
+            "type": "command",
+            "command": "npx -y ccstatusline@latest",
+            "padding": 0
+          },
+          "enabledPlugins": {
+            "superpowers@claude-plugins-official": true,
+            "code-simplifier@claude-plugins-official": true,
+            "context7@claude-plugins-official": true,
+            "frontend-design@claude-plugins-official": true,
+            "security-guidance@claude-plugins-official": true,
+            "ponytail@ponytail": true,
+            "mattpocock-skills@claude-plugins-official": true
+          },
+          "extraKnownMarketplaces": {
+            "claude-plugins-official": {
+              "source": {
+                "source": "github",
+                "repo": "anthropics/claude-plugins-official"
+              }
+            },
+            "ponytail": {
+              "source": {
+                "source": "github",
+                "repo": "DietrichGebert/ponytail"
+              }
+            }
+          },
+          "effortLevel": "high",
+          "includeCoAuthoredBy": false,
+          "gitAttribution": false,
+          "tui": "fullscreen"
+        }
+
+  startup:
+    # Re-runs every boot; `|| true` makes already-installed a no-op.
+    # No volume for ~/.claude/plugins yet — add one if the boot clone gets slow.
+    # Absolute path: startup runs under a bare sh without the login PATH.
+    # No -y: claude 2.1.221 in this image rejects it. Re-add if the image's
+    # claude updates and a non-TTY install starts prompting.
+    - command: ["sh", "-c", 'C=/home/agent/.local/bin/claude; $C plugin marketplace add anthropics/claude-plugins-official || true; $C plugin marketplace add DietrichGebert/ponytail || true; for p in superpowers code-simplifier context7 frontend-design security-guidance mattpocock-skills; do $C plugin install "$p@claude-plugins-official" || true; done; $C plugin install ponytail@ponytail || true']
+      user: "1000"
+      background: false
+      description: Add marketplaces and install plugins
+
+    # Merge, not overwrite — sbx owns bypassPermissions/themeId in settings.json.
+    # Runs LAST and waits for settings.json to be valid JSON: at boot it isn't
+    # written yet, and merging against a missing/empty file left a 0-byte
+    # settings.json.new and no statusline.
+    - command: ["sh", "-c", 'cd ~/.claude; i=0; until jq -e . settings.json >/dev/null 2>&1; do i=$((i+1)); [ $i -gt 30 ] && echo "settings.json never appeared" && exit 0; sleep 1; done; jq -s ".[0] * .[1]" settings.json host-settings.json > settings.json.new && mv settings.json.new settings.json']
+      user: "1000"
+      description: Merge host Claude settings into the sandbox defaults

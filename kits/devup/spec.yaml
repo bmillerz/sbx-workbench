@@ -1,0 +1,15 @@
+schemaVersion: "2"
+kind: mixin
+name: devup
+version: "1.0.0"
+displayName: Start the sandbox's services
+description: Runs the image's `devup`. No-ops on images that don't ship one.
+
+setup:
+  startup:
+    # `devup` (workbench-laravel:v1+) starts pg + redis and makes the
+    # agent a superuser; the fallback keeps this kit working on older images.
+    # `|| true` everywhere — a stock template with no Postgres just no-ops.
+    - command: ["sh", "-c", "command -v devup >/dev/null && devup || { V=$(ls /etc/postgresql 2>/dev/null | head -1); sudo pg_ctlcluster \"$V\" main start 2>/dev/null; sudo service redis-server start >/dev/null 2>&1; sudo -u postgres createuser -s agent 2>/dev/null; true; }"]
+      user: "1000"
+      description: Start Postgres + Redis, make agent a DB superuser
