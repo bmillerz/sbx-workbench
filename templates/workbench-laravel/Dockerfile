@@ -2,9 +2,12 @@
 # Built here rather than via `sbx template save` because sbx's ext4->tar
 # commit path can't read multi-block directories in the sandbox upper layer.
 #   docker build --platform linux/arm64 -t workbench-laravel:v1 .
-#   docker save workbench-laravel:v1 -o workbench-laravel-v1.tar
-#   sbx template load workbench-laravel-v1.tar
+#   docker tag workbench-laravel:v1 docker.io/bmillerz/workbench-laravel:v1
+#   docker push docker.io/bmillerz/workbench-laravel:v1
+# Tags are immutable — bump, never rebuild in place.
 FROM docker/sandbox-templates:claude-code
+
+LABEL org.opencontainers.image.source="https://github.com/bmillerz/sbx-workbench"
 
 USER root
 
