@@ -21,7 +21,7 @@ agent: claude
 workspace: .
 kits:
   - docker.io/bmillerz/claude-config:1.0.0
-  - docker.io/bmillerz/devup:1.3.0
+  - docker.io/bmillerz/devup:1.0.0
 sandboxOptions:
   template: docker.io/bmillerz/workbench-laravel:v1
 ports:

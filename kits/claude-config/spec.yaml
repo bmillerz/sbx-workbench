@@ -4,6 +4,7 @@ name: claude-config
 version: "1.0.0"
 displayName: Claude Code config
 description: Carries the host's statusline, plugins, prefs and global CLAUDE.md into a sandbox.
+sourceURL: https://github.com/bmillerz/sbx-workbench/tree/main/kits/claude-config
 
 setup:
   files:

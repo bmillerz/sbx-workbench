@@ -4,6 +4,7 @@ name: devup
 version: "1.0.0"
 displayName: Start the sandbox's services
 description: Runs the image's `devup`. No-ops on images that don't ship one.
+sourceURL: https://github.com/bmillerz/sbx-workbench/tree/main/kits/devup
 
 setup:
   startup:
