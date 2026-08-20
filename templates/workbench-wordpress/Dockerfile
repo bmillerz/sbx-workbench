@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 # WordPress workbench template for Docker Sandboxes (sbx).
-#   docker build --platform linux/arm64 -t workbench-wordpress:v1 .
-#   docker tag workbench-wordpress:v1 docker.io/bmillerz/workbench-wordpress:v1
-#   docker push docker.io/bmillerz/workbench-wordpress:v1
+#   docker build --platform linux/arm64 -t workbench-wordpress:v2 .
+#   docker tag workbench-wordpress:v2 docker.io/bmillerz/workbench-wordpress:v2
+#   docker push docker.io/bmillerz/workbench-wordpress:v2
 # Tags are immutable — bump, never rebuild in place.
 #
 # ponytail: PHP 8.5, not the 8.3 that Cloudways runs. Ubuntu 26.04 ships only
@@ -52,6 +52,7 @@ RUN ln -sf "$(ls -d /opt/playwright/chromium-*/chrome-linux/chrome | head -1)" /
 # ponytail: FollowSymLinks + AllowOverride so WP permalinks work via .htaccess.
 RUN printf '%s\n' \
   '<VirtualHost *:80>' \
+  '  ServerName localhost' \
   '  DocumentRoot /var/www/html' \
   '  <Directory /var/www/html>' \
   '    Options FollowSymLinks' \
@@ -62,6 +63,19 @@ RUN printf '%s\n' \
   > /etc/apache2/sites-available/000-default.conf \
  && a2enmod rewrite >/dev/null \
  && rm -rf /var/www/html
+
+# WordPress uploads plugin zips and media through wp-admin, where Ubuntu's 2M
+# default fails, and plugin-heavy sites exhaust 128M. max_allowed_packet is for
+# `wp db import` of client dumps with large serialised options.
+RUN printf '%s\n' \
+  'upload_max_filesize = 128M' \
+  'post_max_size = 128M' \
+  'memory_limit = 512M' \
+  'max_execution_time = 300' \
+  > /etc/php/8.5/apache2/conf.d/99-sandbox.ini \
+ && cp /etc/php/8.5/apache2/conf.d/99-sandbox.ini /etc/php/8.5/cli/conf.d/99-sandbox.ini \
+ && printf '%s\n' '[mysqld]' 'max_allowed_packet = 256M' \
+  > /etc/mysql/mariadb.conf.d/99-sandbox.cnf
 
 # Sandboxes have no init, so nothing starts the services apt just installed.
 # ponytail: same contract as workbench-laravel — idempotent, always exits 0, so
@@ -90,7 +104,14 @@ sudo mariadb -e "ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_passw
 mariadb-admin ping >/dev/null 2>&1 && echo "mariadb up" || echo "mariadb DOWN"
 redis-cli ping >/dev/null 2>&1 && echo "redis up" || echo "redis DOWN"
 pidof apache2 >/dev/null && echo "apache up" || echo "apache DOWN"
-[ -e /var/www/html ] || echo "note: sudo ln -sfn \"$PWD\" /var/www/html"
+if [ ! -e /var/www/html ]; then
+  W=$(ls -d "$PWD"/wp-load.php "$PWD"/*/wp-load.php 2>/dev/null | head -1)
+  if [ -n "$W" ]; then
+    sudo ln -sfn "$(dirname "$W")" /var/www/html && echo "docroot -> $(dirname "$W")"
+  else
+    echo "note: sudo ln -sfn \"$PWD\" /var/www/html"
+  fi
+fi
 exit 0
 DEVUP
 chmod 755 /usr/local/bin/devup
