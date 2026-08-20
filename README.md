@@ -22,7 +22,7 @@ agent: claude
 workspace: .
 kits:
   - docker.io/bmillerz/claude-config:1.0.0
-  - docker.io/bmillerz/devup:1.0.0
+  - docker.io/bmillerz/devup:1.0.1
 sandboxOptions:
   template: docker.io/bmillerz/workbench-laravel:v1
 ports:
@@ -58,7 +58,7 @@ docker tag workbench-laravel:v1 docker.io/bmillerz/workbench-laravel:v1
 docker push docker.io/bmillerz/workbench-laravel:v1
 
 sbx kit validate kits/devup
-sbx kit push kits/devup docker.io/bmillerz/devup:1.0.0
+sbx kit push kits/devup docker.io/bmillerz/devup:1.0.1
 ```
 
 Kit tags must match the spec's `version:` — separate strings, nothing syncs them.
