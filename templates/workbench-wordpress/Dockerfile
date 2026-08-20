@@ -82,6 +82,11 @@ U=$(id -un)
 sudo mariadb -e "CREATE USER IF NOT EXISTS \`$U\`@localhost IDENTIFIED BY '';
   GRANT ALL PRIVILEGES ON *.* TO \`$U\`@localhost WITH GRANT OPTION;
   FLUSH PRIVILEGES;" 2>/dev/null
+# Client wp-config.php files commonly use root with an empty password in dev,
+# and they are committed, so the sandbox accommodates them rather than the
+# other way round. Loopback only, throwaway sandbox - same posture as the
+# Laravel image's pg_hba trust.
+sudo mariadb -e "ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING '';" 2>/dev/null
 mariadb-admin ping >/dev/null 2>&1 && echo "mariadb up" || echo "mariadb DOWN"
 redis-cli ping >/dev/null 2>&1 && echo "redis up" || echo "redis DOWN"
 pidof apache2 >/dev/null && echo "apache up" || echo "apache DOWN"
