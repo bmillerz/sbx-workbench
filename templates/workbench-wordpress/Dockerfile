@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1
 # WordPress workbench template for Docker Sandboxes (sbx).
-#   docker build --platform linux/arm64 -t workbench-wordpress:v2 .
-#   docker tag workbench-wordpress:v2 docker.io/bmillerz/workbench-wordpress:v2
-#   docker push docker.io/bmillerz/workbench-wordpress:v2
+#   docker build --platform linux/arm64 -t workbench-wordpress:v3 .
+#   docker tag workbench-wordpress:v3 docker.io/bmillerz/workbench-wordpress:v3
+#   docker push docker.io/bmillerz/workbench-wordpress:v3
 # Tags are immutable — bump, never rebuild in place.
 #
 # ponytail: PHP 8.5, not the 8.3 that Cloudways runs. Ubuntu 26.04 ships only
@@ -89,6 +89,10 @@ RUN <<'SH'
 cat > /usr/local/bin/devup <<'DEVUP'
 #!/bin/sh
 # Start the services a sandbox has no init to start. Safe to re-run.
+# /run is a fresh tmpfs in a sandbox and nothing populates it - apache and
+# mysqld both need their rundir to exist before their init script will start.
+sudo mkdir -p /run/apache2 /run/lock /run/mysqld /run/redis
+sudo chown mysql:mysql /run/mysqld 2>/dev/null
 sudo service mariadb start >/dev/null 2>&1
 sudo service redis-server start >/dev/null 2>&1
 sudo service apache2 start >/dev/null 2>&1
@@ -105,7 +109,15 @@ mariadb-admin ping >/dev/null 2>&1 && echo "mariadb up" || echo "mariadb DOWN"
 redis-cli ping >/dev/null 2>&1 && echo "redis up" || echo "redis DOWN"
 pidof apache2 >/dev/null && echo "apache up" || echo "apache DOWN"
 if [ ! -e /var/www/html ]; then
+  # $PWD is not the workspace when the kit runs this at boot, so fall back to
+  # the bind-mounted workspace, which shows up as a mount point under the
+  # host's absolute path.
+  R=$(awk '$5 ~ "^/(Users|Volumes)/" {print $5}' /proc/self/mountinfo)
   W=$(ls -d "$PWD"/wp-load.php "$PWD"/*/wp-load.php 2>/dev/null | head -1)
+  for d in $R; do
+    [ -n "$W" ] && break
+    W=$(ls -d "$d"/wp-load.php "$d"/*/wp-load.php 2>/dev/null | head -1)
+  done
   if [ -n "$W" ]; then
     sudo ln -sfn "$(dirname "$W")" /var/www/html && echo "docroot -> $(dirname "$W")"
   else
