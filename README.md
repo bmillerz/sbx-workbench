@@ -8,6 +8,7 @@ templates/workbench-laravel/   PHP 8.5, Postgres, Redis, sqlite, node 22, gh, ch
 templates/workbench-wordpress/ PHP 8.5, MariaDB, Apache, wp-cli, node 22, gh, chromium
 kits/claude-config/            global CLAUDE.md, statusline, plugins
 kits/devup/                    starts the services the image ships stopped
+kits/project-setup/            runs the workspace's sandbox-setup.sh at boot
 ```
 
 ## Use
@@ -49,6 +50,13 @@ then `composer dev` — `SERVER_HOST` above makes it bind dual-stack.
 WordPress serves over Apache on port 80, so publish `sandbox: 80` and point the
 docroot at the project once inside: `sudo ln -sfn "$PWD" /var/www/html`. Import a
 dump with `sbx cp` then `wp db import`, and fix URLs with `wp search-replace`.
+
+Projects with more provisioning than a symlink (multiple vhosts, per-site
+databases, dump restores) ship an executable `sandbox-setup.sh` in the workspace
+root and add the `project-setup` kit *after* `devup` — the kit runs the script
+on every boot, so keep it idempotent. Databases live in the sandbox, not the
+workspace: have the script restore from dumps committed or synced into the
+workspace, and dump back to it before deliberate recreates.
 
 ## Publish
 

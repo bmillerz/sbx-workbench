@@ -1,0 +1,19 @@
+schemaVersion: "2"
+kind: mixin
+name: project-setup
+version: "1.0.0"
+displayName: Run the workspace's sandbox-setup.sh
+description: Runs an executable `sandbox-setup.sh` from the workspace root at boot. No-ops when the workspace doesn't ship one.
+sourceURL: https://github.com/bmillerz/sbx-workbench/tree/main/kits/project-setup
+
+setup:
+  startup:
+    # Same workspace discovery as the image's devup: at boot $PWD is not the
+    # workspace, so find the bind mount under the host's absolute path.
+    # Direct mode only — clone-mode workspaces don't mount under /Users.
+    # List this kit AFTER devup in .sbxenv.yaml: setup scripts assume the
+    # image's services are already up, and a failure here aborts the
+    # dispatcher for any kit that follows.
+    - command: ["sh", "-c", "for d in $(awk '$5 ~ \"^/(Users|Volumes)/\" {print $5}' /proc/self/mountinfo); do [ -x \"$d/sandbox-setup.sh\" ] && exec \"$d/sandbox-setup.sh\"; done; echo \"no sandbox-setup.sh in workspace - nothing to do\""]
+      user: "1000"
+      description: Run the workspace's sandbox-setup.sh if present
