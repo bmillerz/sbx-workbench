@@ -1,0 +1,65 @@
+# syntax=docker/sandbox-kit:3
+schemaVersion: "3"
+kind: mixin
+displayName: Claude Code config
+description: >-
+  Carries the host's Claude Code preferences into a sandbox: a ccstatusline
+  status line (alongside sbx Desktop's, not instead of it), settings and
+  global communication-style instructions. Merges into settings.json, so the
+  claude kit's own keys survive. Plugins aren't here: they live on the
+  claude.ai account and sync into every session signed in to it.
+sourceUrl: https://github.com/bmillerz/sbx-workbench/tree/main/kits/claude-config
+
+# The kit's own release, and the tag it publishes under. Bump it when the
+# overlay or these declarations change — never rebuild a published tag.
+version: "2.0.0"
+
+# `claude` orders this kit's install hook after the claude kit's, which
+# seeds settings.json from scratch on every create — merging before that
+# would be overwritten. `deb/jq` is derived from the workload's dpkg
+# database; the merge needs it. node (for ccstatusline) can't be required:
+# Ubuntu's nodejs version carries a `~`, so publishing drops deb/nodejs.
+requires: ["claude", "deb/jq"]
+
+# No network-policy: the hook only reads files the overlay ships, and
+# ccstatusline renders locally.
+
+capabilities:
+  - type: com.docker.sandbox/lifecycle@1
+    config:
+      install:
+        # Merge, not overwrite: the claude kit owns hooks, permissions and the
+        # theme. Only the keys in files/settings.json change, statusLine among
+        # them. Same-directory temp file so the mv is an atomic rename. Runs
+        # as agent, who owns ~/.claude by now.
+        #
+        # The apiKeyHelper deletion is Docker's own fix, ported early
+        # (docker/sbx-kits-contrib#405): the claude kit writes the helper for
+        # a subscription login too, and Claude Code then treats the session as
+        # API-key and stops syncing claude.ai plugins — which is where the
+        # plugins now come from. Only Docker's sentinel is removed, and only
+        # for OAuth. Drop this once the claude mixin pin includes the fix.
+        - command: |
+            set -eu
+            D=/usr/local/share/claude-config
+            S=/home/agent/.claude/settings.json
+            mkdir -p /home/agent/.claude /home/agent/.config/ccstatusline
+            [ -f "$S" ] || echo '{}' > "$S"
+            tmp=$(mktemp -p /home/agent/.claude)
+            jq -s --arg mode "${SBX_CRED_ANTHROPIC_MODE:-none}" '
+              .[0] * .[1]
+              | if $mode == "oauth" and .apiKeyHelper == "echo proxy-managed"
+                then del(.apiKeyHelper) else . end
+            ' "$S" "$D/settings.json" > "$tmp"
+            mv "$tmp" "$S"
+            cp "$D/ccstatusline.json" /home/agent/.config/ccstatusline/settings.json
+          user: agent
+          env: [SBX_CRED_ANTHROPIC_MODE]
+          description: Merge host preferences into settings.json, keep claude.ai plugin sync on for subscription logins, install the ccstatusline layout
+
+  # A body only: the claude kit owns the CLAUDE.md profile this lands in.
+  # @1 because that's what the claude mixin declares, and @1 and @2 can't
+  # compose.
+  - type: com.docker.sandbox/agent-context@1
+    config:
+      contentFile: ./claude-config-context.md

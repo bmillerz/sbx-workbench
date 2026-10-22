@@ -1,0 +1,3 @@
+# For `wp db import` of client dumps with large serialised options.
+[mysqld]
+max_allowed_packet = 256M

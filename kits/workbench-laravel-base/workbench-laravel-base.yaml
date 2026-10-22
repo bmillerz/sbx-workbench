@@ -1,0 +1,74 @@
+# syntax=docker/sandbox-kit:3
+schemaVersion: "3"
+kind: workload
+displayName: Laravel workbench (base)
+description: >-
+  PHP 8.5, Composer, Postgres, Redis and sqlite on Docker's Ubuntu shell
+  template, with the services started at every boot. Ships no agent: compose
+  it with docker/sbx-kit-claude-mixin, or use the workbench-laravel set.
+sourceUrl: https://github.com/bmillerz/sbx-workbench/tree/main/kits/workbench-laravel-base
+
+# The kit's own release, and the tag it publishes under. Bump it when the
+# recipe or these declarations change — never rebuild a published tag.
+version: "2.0.0"
+
+# The image's ENTRYPOINT launches `claude`, which only a claude kit supplies.
+# Requiring it makes a composition without one fail at create, not at launch.
+requires: ["claude"]
+
+capabilities:
+  # An agent sandbox: sbx launches the ENTRYPOINT as the agent rather than
+  # as PID 1, and honours the image's `agent` user.
+  - type: com.docker.sandbox/sbx@1
+
+  # `composer dev` keeps serving after the last session detaches.
+  - type: com.docker.sandbox/long-running@1
+
+  # Steady-state egress for the work this image exists for. An absent phase
+  # grants nothing, and startup hooks run in the runtime phase.
+  #   packagist + GitHub  composer metadata and dist zips
+  #   npm                 npm ci / Vite
+  #   Ubuntu, Docker, gh  every apt source the base configures — `apt-get
+  #                       update` fails if any one is unreachable, and the
+  #                       claude mixin runs one in the background each boot.
+  #                       ports.ubuntu.com is arm64, the other two amd64.
+  - type: com.docker.sandbox/network-policy@1
+    config:
+      runtime:
+        allow:
+          - packagist.org
+          - repo.packagist.org
+          - github.com
+          - api.github.com
+          - codeload.github.com
+          - objects.githubusercontent.com
+          - registry.npmjs.org
+          - archive.ubuntu.com
+          - security.ubuntu.com
+          - ports.ubuntu.com
+          - download.docker.com
+          - cli.github.com
+
+  # The kit names the container ports; the host side is the user's choice
+  # (`ports:` in sbxenv.yaml), otherwise an ephemeral port.
+  - type: com.docker.sandbox/port@1
+    description: php artisan serve
+    config: {name: laravel, container: 8000}
+  - type: com.docker.sandbox/port@1
+    description: Vite dev server
+    config: {name: vite, container: 5173}
+
+  # No init in a sandbox, so apt's services come up installed-but-stopped.
+  # Stable sbx runs startup hooks alongside the agent rather than before it;
+  # Postgres is up within a couple of seconds, well before a first migration.
+  - type: com.docker.sandbox/lifecycle@1
+    config:
+      startup:
+        - command: /usr/local/bin/devup
+          user: agent
+          description: Start Postgres and Redis, make agent a Postgres superuser
+
+  # A body only: the claude mixin owns the CLAUDE.md profile this lands in.
+  - type: com.docker.sandbox/agent-context@1
+    config:
+      contentFile: ./workbench-laravel-base-context.md

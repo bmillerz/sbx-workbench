@@ -1,0 +1,11 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "/usr/local/bin/claude-config-statusline",
+    "padding": 0
+  },
+  "effortLevel": "high",
+  "includeCoAuthoredBy": false,
+  "gitAttribution": false,
+  "tui": "fullscreen"
+}

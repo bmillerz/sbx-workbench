@@ -1,0 +1,17 @@
+#!/bin/sh
+# Start the services a sandbox has no init to start. Safe to re-run: the
+# workload's startup hook runs it on every boot, and it's on PATH for a
+# manual restart.
+# /run is a fresh tmpfs in a sandbox and nothing populates it.
+sudo mkdir -p /run/postgresql /run/redis
+sudo chown postgres:postgres /run/postgresql 2>/dev/null
+sudo chown redis:redis /run/redis 2>/dev/null
+V=$(ls /etc/postgresql 2>/dev/null | head -1)
+[ -n "$V" ] && sudo pg_ctlcluster "$V" main start 2>/dev/null
+sudo service redis-server start >/dev/null 2>&1
+# The agent user (uid 1000) is the platform floor, so name it rather than
+# trusting $(id -un) — the hook may run as root.
+sudo -u postgres createuser -s agent 2>/dev/null
+pg_isready -q && echo "postgres $V up" || echo "postgres DOWN"
+redis-cli ping >/dev/null 2>&1 && echo "redis up" || echo "redis DOWN"
+exit 0

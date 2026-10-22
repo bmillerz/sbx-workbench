@@ -1,0 +1,44 @@
+#!/bin/sh
+# Start the services a sandbox has no init to start. Safe to re-run: the
+# workload's startup hook runs it on every boot, and it's on PATH for a
+# manual restart.
+# /run is a fresh tmpfs in a sandbox and nothing populates it - apache and
+# mysqld both need their rundir to exist before their init script will start.
+sudo mkdir -p /run/apache2 /run/lock /run/mysqld /run/redis
+sudo chown mysql:mysql /run/mysqld 2>/dev/null
+sudo chown redis:redis /run/redis 2>/dev/null
+sudo service mariadb start >/dev/null 2>&1
+sudo service redis-server start >/dev/null 2>&1
+sudo service apache2 start >/dev/null 2>&1
+# MariaDB root authenticates via unix_socket, hence plain `sudo mariadb`. The
+# agent user (uid 1000, the platform floor - named, since the hook may run as
+# root) needs an explicit `IDENTIFIED BY ''`: MariaDB 11.8 gives a bare CREATE
+# USER an unusable auth string, which fails login with error 1698.
+sudo mariadb -e "CREATE USER IF NOT EXISTS \`agent\`@localhost IDENTIFIED BY '';
+  GRANT ALL PRIVILEGES ON *.* TO \`agent\`@localhost WITH GRANT OPTION;
+  FLUSH PRIVILEGES;" 2>/dev/null
+# Client wp-config.php files commonly use root with an empty password in dev,
+# and they are committed, so the sandbox accommodates them rather than the
+# other way round. Loopback only, throwaway sandbox - same posture as the
+# Laravel workload's pg_hba trust.
+sudo mariadb -e "ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password USING '';" 2>/dev/null
+mariadb-admin ping >/dev/null 2>&1 && echo "mariadb up" || echo "mariadb DOWN"
+redis-cli ping >/dev/null 2>&1 && echo "redis up" || echo "redis DOWN"
+pidof apache2 >/dev/null && echo "apache up" || echo "apache DOWN"
+if [ ! -e /var/www/html ]; then
+  # Point the docroot at the first WordPress install in the workspace. sbx
+  # exports the primary workspace as $WORKSPACE_DIR (the hook declares it);
+  # $PWD covers a manual run from the project.
+  W=""
+  for d in "${WORKSPACE_DIR:-}" "$PWD"; do
+    [ -n "$d" ] || continue
+    W=$(ls -d "$d"/wp-load.php "$d"/*/wp-load.php 2>/dev/null | head -1)
+    [ -n "$W" ] && break
+  done
+  if [ -n "$W" ]; then
+    sudo ln -sfn "$(dirname "$W")" /var/www/html && echo "docroot -> $(dirname "$W")"
+  else
+    echo "note: sudo ln -sfn \"\$PWD\" /var/www/html"
+  fi
+fi
+exit 0

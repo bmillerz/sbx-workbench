@@ -1,0 +1,28 @@
+# syntax=docker/sandbox-kit:3
+schemaVersion: "3"
+kind: set
+displayName: WordPress workbench
+description: >-
+  The WordPress workbench with Claude Code and headless Chromium, pinned
+  together as one reference: workbench-wordpress-base, Docker's Claude Code
+  mixin and Docker's Playwright mixin.
+sourceUrl: https://github.com/bmillerz/sbx-workbench/tree/main/kits/workbench-wordpress
+
+# The set's own release. Bump it whenever any pin below moves.
+version: "2.0.0"
+
+args:
+  # Where workbench-wordpress-base was pushed. A build-phase arg, so a test
+  # build can point at a throwaway localhost:5000 registry.
+  registry:
+    default: docker.io/bmillerz
+    pattern: '^[a-z0-9][a-z0-9._/:-]*$'
+    description: Registry namespace workbench-wordpress-base was pushed to
+    buildArg: KIT_REGISTRY
+
+# Publishing pins each by digest. Order carries no meaning; the base's
+# `requires: ["claude"]` is what puts the claude mixin ahead of it.
+kits:
+  - ref: ${{ kit.args.registry }}/workbench-wordpress-base:2.0.0
+  - ref: docker.io/docker/sbx-kit-claude-mixin:2.1.292
+  - ref: docker.io/docker/sbx-kit-playwright:1.61.1
