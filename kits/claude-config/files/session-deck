@@ -1,0 +1,961 @@
+#!/usr/bin/env python3
+"""session-deck: the deck plugin's pane as a terminal command.
+
+A port of the deck plugin (hooks/register.tsx, v0.18.1): the same records, the same rules and the
+same layout, drawn full-screen in a terminal of its own. It reads ~/.claude/jobs (the sessions), the
+end of each session's transcript and its subagents folder, and git in one repository. It only reads.
+
+    session-deck              live view; q or Ctrl+C quits
+    session-deck --once       print one frame and exit (--plain: no colour, --cols N: width)
+    --repo PATH               the repository whose worktrees and unpushed commits are shown; the
+                              default is the one you run it from, else the latest session's
+    --truecolor               exact 24-bit colours; the default is the 256-colour palette, which
+                              every terminal reads (Terminal.app shows 24-bit codes as white blocks)
+    --no-mouse                leave the mouse to the terminal: plain text selection, and the wheel
+                              scrolls only where the terminal sends it as arrows
+    --home PATH               the home whose ~/.claude/jobs is read; the default is yours
+
+Scroll with the wheel, ↑↓ or j k, PgUp PgDn or space b, and g G for the top and bottom.
+"""
+import json
+import os
+import random
+import re
+import select
+import shutil
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+
+# The plugin's constants, in seconds where it counts milliseconds.
+MOST = 5                 # unpushed commits listed
+STATUS_EVERY = 30        # uncommitted-file counts: the one scan HEAD can't tell us about
+SIZE_EVERY = 30 * 60     # disk sizes: slow to measure, and only wanted for cleanup candidates
+OLD_MIN = 7 * 1440       # a worktree this many minutes past its last commit is a cleanup candidate
+NEW_S = 6 * 3600         # an untouched worktree younger than this is probably about to be used
+DAY = 86400
+AGENT_IDLE = 300         # an agent whose transcript has been quiet this long has finished or been stopped
+AGENT_SCAN_EVERY = 15    # an active agent's transcript tail is re-read at most this often
+AGENT_MOST = 3
+SLOW = 1.0               # a refresh slower than this is flagged
+STALE = 20               # data this old is flagged too
+TREE_CONCURRENCY = 4     # worktrees inspected at once
+RETRY = 60               # a worktree git could not read is tried again no sooner than this
+COMMITS_CAP = 200        # unpushed commits kept; five are shown
+SIZES_PER_TICK = 3       # disk sizes measured in one refresh; the rest wait for the next
+TREE_MOST = 12           # worktrees listed before "+N more"
+AGENT_DONE = 20          # an agent whose last word is a finished message, quiet this long, has finished
+QUIET = 60               # a session idle and silent this long, having finished a message, is waiting for you
+LEFTOVER_MOST = 8        # orphaned folders listed before "+N more"
+OLD_RECHECK = 300        # a session finished over a day ago is looked at again this often
+JOBS_EVERY = 2.5         # session records are re-read no more often than this
+REFRESH = 3              # seconds between refreshes
+FRAME = 0.5              # seconds between redraws: the working dot pulses, clocks tick
+WHEEL_LINES = 3          # lines one notch of the mouse wheel scrolls
+
+C = {'yours': '#fcd34d', 'done': '#86efac', 'failed': '#fca5a5', 'dim': '#6b7280', 'faint': '#3f4654',
+     'text': '#e5e7eb', 'soft': '#9ca3af', 'working': '#7dd3fc'}
+
+
+# ---------- formatting ----------
+
+def clock(sec):
+    """A running clock: 12s, 4m 12s, 1h 4m, 2d 3h."""
+    sec = max(0, int(sec))
+    if sec < 60:
+        return f'{sec}s'
+    if sec < 3600:
+        return f'{sec // 60}m {sec % 60}s'
+    if sec < 86400:
+        return f'{sec // 3600}h {sec // 60 % 60}m'
+    return f'{sec // 86400}d {sec // 3600 % 24}h'
+
+
+def age(minutes):
+    if minutes < 0:
+        return '?'
+    if minutes < 60:
+        return f'{minutes}m'
+    return f'{minutes // 60}h' if minutes < 1440 else f'{minutes // 1440}d'
+
+
+def ago(sec):
+    """How long ago something finished: no seconds, since it is history."""
+    return 'just now' if sec < 60 else f'{age(int(sec // 60))} ago'
+
+
+def size(mb):
+    return f'{mb / 1024:.1f} GB' if mb >= 1024 else f'{mb} MB'
+
+
+def cut(s, n):
+    n = max(1, n)
+    return s if len(s) <= n else s[:n - 1] + '…'
+
+
+def pretty_model(model_id):
+    """claude-opus-5-5 -> Opus 5.5, claude-haiku-4-5-20251001 -> Haiku 4.5; a bare alias (opus) -> Opus."""
+    m = re.match(r'^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?![\d])', model_id)
+    cap = lambda w: w[:1].upper() + w[1:]
+    if not m:
+        return cap(re.sub(r'^claude-', '', model_id))
+    family, major, minor = m.groups()
+    return f"{cap(family)} {major}{'.' + minor if minor else ''}"
+
+
+def parse_ts(s):
+    try:
+        return datetime.fromisoformat(s).timestamp() if isinstance(s, str) else None
+    except ValueError:
+        return None
+
+
+def num(s):
+    try:
+        return int(s.strip())
+    except (ValueError, AttributeError):
+        return None
+
+
+# ---------- reading ----------
+
+def run(argv, cwd=None):
+    """(exit code, stdout); 127 and nothing when the command could not run at all."""
+    try:
+        r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=30)
+        return r.returncode, r.stdout
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 127, ''
+
+
+def tail(path, n):
+    """The last `n` bytes of a file as text; its first line is usually cut and does not parse."""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - n))
+            return f.read().decode('utf-8', 'replace')
+    except (OSError, TypeError, ValueError):
+        return ''
+
+
+def read_text(path):
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            return f.read()
+    except (OSError, TypeError, ValueError):
+        return ''
+
+
+def ls(path):
+    """(name, is a folder, modified time) for each entry; nothing when the folder can't be read."""
+    out = []
+    try:
+        with os.scandir(path) as it:
+            for e in it:
+                try:
+                    out.append((e.name, e.is_dir(), e.stat().st_mtime))
+                except OSError:
+                    pass
+    except (OSError, TypeError, ValueError):
+        pass
+    return out
+
+
+def mtime(path):
+    try:
+        return os.stat(path).st_mtime
+    except (OSError, TypeError, ValueError):
+        return 0
+
+
+def du_mb(path):
+    """Disk use in MB, or None if `du` failed."""
+    code, out = run(['du', '-sk', path])
+    kb = num(out.split('\t')[0]) if out else None
+    return int(kb / 1024 + 0.5) if code == 0 and kb is not None else None
+
+
+def is_tree(cwd):
+    return isinstance(cwd, str) and '/.claude/worktrees/' in cwd
+
+
+# An absolute worktree path inside a tool call's input: `/…/.claude/worktrees/<name>`.
+TREE_PATH = re.compile(r'(/[^"\s\'`;&|]*/\.claude/worktrees/[A-Za-z0-9._-]+)')
+
+
+def blocks(c, kind):
+    return isinstance(c, list) and any(isinstance(b, dict) and b.get('type') == kind for b in c)
+
+
+def parse_tail(text, keep_sidechain=False):
+    """What the end of a transcript says: when it was interrupted (if that is its last word), the last
+    prompt, whether Claude's last word was a plain message, and the shell's directory (its last worktree,
+    if any). An agent's own transcript marks every record as a side chain, so for those the marker is
+    not a reason to skip."""
+    halted = reply = 0
+    cwd = tree_cwd = ''
+    last_is_text = False
+    for line in text.split('\n'):
+        try:
+            o = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(o, dict):
+            continue
+        if isinstance(o.get('cwd'), str):
+            cwd = o['cwd']
+        if is_tree(o.get('cwd')):
+            tree_cwd = o['cwd']
+        if (not keep_sidechain and o.get('isSidechain')) or o.get('type') not in ('user', 'assistant'):
+            continue
+        msg = o.get('message')
+        c = msg.get('content') if isinstance(msg, dict) else None
+        # `cd <worktree> && …` inside one command never moves the record's cwd: the path the session's own
+        # tool call names says where it works. Only its own calls: tool output names every worktree.
+        if o['type'] == 'assistant' and isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get('type') == 'tool_use':
+                    named = TREE_PATH.findall(json.dumps(b.get('input') if b.get('input') is not None else '', ensure_ascii=False))
+                    if named:
+                        tree_cwd = named[-1]
+        body = c if isinstance(c, str) else ' '.join(str(b.get('text') or '') if isinstance(b, dict) else '' for b in c) if isinstance(c, list) else ''
+        at = parse_ts(o.get('timestamp')) or 0
+        # A plain message from Claude, as opposed to a tool call it is about to make.
+        last_is_text = o['type'] == 'assistant' and (isinstance(c, str) or (blocks(c, 'text') and not blocks(c, 'tool_use')))
+        halted = at if o['type'] == 'user' and body.startswith('[Request interrupted') else 0
+        injected = body.startswith('<task-notification') or body.startswith('<system-reminder')
+        if (o['type'] == 'user' and not injected and not body.startswith('[Request interrupted')
+                and not blocks(c, 'tool_result')):
+            reply = at
+    return {'halted': halted, 'reply': reply, 'cwd': tree_cwd or cwd, 'tree': tree_cwd, 'last_is_text': last_is_text}
+
+
+def parse_porcelain(text):
+    out = []
+    for block in re.split(r'\n\n+', text.strip()):
+        lines = block.split('\n')
+        get = lambda k: next((l[len(k):] for l in lines if l.startswith(k)), '')
+        head = get('HEAD ')
+        out.append({'path': get('worktree '), 'branch': get('branch ').replace('refs/heads/', '') or f'detached {head[:7]}', 'head': head})
+    return out
+
+
+def find_repo(argv, home):
+    """--repo, else the repository you run it from, else the latest session's (a fresh terminal in ~)."""
+    if '--repo' in argv[:-1]:
+        return os.path.abspath(argv[argv.index('--repo') + 1])
+    cwd = os.getcwd()
+    if run(['git', 'rev-parse', '--git-dir'], cwd)[0] == 0:
+        return cwd
+    best_at, best = 0, None
+    for name, is_dir, _ in ls(f'{home}/.claude/jobs'):
+        try:
+            with open(f'{home}/.claude/jobs/{name}/state.json') as f:
+                j = json.load(f)
+        except (OSError, ValueError):
+            continue
+        repo, at = j.get('originCwd') or j.get('cwd'), parse_ts(j.get('updatedAt')) or 0
+        if isinstance(repo, str) and at > best_at and os.path.isdir(repo):
+            best_at, best = at, repo
+    return best or cwd
+
+
+class Deck:
+    """The plugin's state: git kept between checks, and per-file memos so only what moved is read again."""
+
+    def __init__(self, home, repo):
+        self.home, self.repo = home, repo
+        self.lock = threading.Lock()
+        self.ready = False
+        self.snap = {'trees': [], 'leftovers': [], 'deploy': None, 'error': None, 'loading': True}
+        self.view = {'needs': [], 'working': [], 'completed': []}
+        self.jobs_at = 0
+        self.health = {'slow': 0, 'failed': False, 'jobs_failed': False, 'ok_at': 0}
+        self.memo = {'sig': '', 'status_at': 0, 'sizes_pending': False, 'main_head': '', 'upstream': '',
+                     'deploy': None, 'trees': {}, 'leftovers': {}}
+        self.scans = {}       # transcript -> what its last 16 KB said, re-read only when its modified time moves
+        self.models = {}      # transcript -> the model of its latest assistant message, and where its shell is
+        self.work_start = {}  # session -> when it was first seen working, for those with no recent prompt
+        self.agent_meta = {}  # agent meta file -> its contents, re-read only when it moves
+        self.agent_scan = {}  # agent transcript -> what its end said
+        self.learned = {}     # family -> full name, learned from any session that names the exact model
+        self.by_dir = {}      # session folder -> its parsed record, when it was read, whether it is old
+
+    # ----- git: worktrees, leftovers, unpushed commits -----
+
+    def gather(self, now, force):
+        """One cheap pass: `git worktree list` (it carries every worktree's HEAD) and the upstream. Anything
+        that hasn't moved is reused; None means nothing changed. A forced pass (opening) skips the slow disk
+        sizes; the next refresh measures them. A git command that fails is unknown (-1), never zero."""
+        memo = self.memo
+        code, out = run(['git', 'worktree', 'list', '--porcelain'], self.repo)
+        if code != 0:
+            raise RuntimeError('git worktree list failed')
+        listed = parse_porcelain(out)
+        if not listed:
+            raise RuntimeError('git listed no worktrees')
+        main, rest = listed[0], listed[1:]
+        # The main checkout's own branch is the base, whatever it is called.
+        base = main['head'] if main['branch'].startswith('detached') else main['branch']
+        code, out = run(['git', 'rev-parse', f'{base}@{{u}}'], main['path'])
+        upstream = out.strip() if code == 0 else ''
+        sig = '|'.join([main['head'], upstream] + [f"{w['path']}@{w['head']}" for w in rest])
+        status_due = force or now - memo['status_at'] >= STATUS_EVERY
+        if not force and sig == memo['sig'] and not status_due and not memo['sizes_pending']:
+            return None
+
+        def inspect(wt):
+            m = memo['trees'].get(wt['path']) or {'head': '', 'main_head': '', 'committed_at': 0, 'ahead': 0, 'dirty': 0,
+                                                  'touched_at': 0, 'size_mb': None, 'size_at': 0, 'failed_at': 0}
+            head_moved = m['head'] != wt['head']
+            # A worktree git could not read (a deleted folder, a broken link) is retried slowly.
+            retry_due = m['failed_at'] == 0 or now - m['failed_at'] >= RETRY
+            if (head_moved or m['main_head'] != main['head']) and retry_due:
+                lc, lo = run(['git', 'log', '-1', '--format=%ct'], wt['path'])
+                ac, ao = run(['git', 'rev-list', '--count', f"{base}..{wt['head']}"], main['path'])
+                committed = num(lo) if lc == 0 else None
+                ahead = num(ao) if ac == 0 else None
+                m['committed_at'] = committed or -1
+                m['ahead'] = ahead if ahead is not None else -1
+                # Remember the commit only when git answered, so a failure is retried (after the back-off).
+                if m['committed_at'] > 0 and m['ahead'] >= 0:
+                    m.update(head=wt['head'], main_head=main['head'], failed_at=0)
+                else:
+                    m['failed_at'] = now
+            if (head_moved or status_due) and retry_due:
+                sc, so = run(['git', '--no-optional-locks', 'status', '--porcelain'], wt['path'])
+                m['dirty'] = len([l for l in so.split('\n') if l]) if sc == 0 else -1
+                if m['dirty'] < 0:
+                    m['failed_at'] = now
+                # The worktree's own HEAD file moves when it is created, committed to or switched.
+                g = re.search(r'^gitdir:\s*(.+)$', read_text(f"{wt['path']}/.git"), re.M)
+                m['touched_at'] = mtime(f'{g.group(1).strip()}/HEAD') if g else 0
+            return wt, m
+
+        with ThreadPoolExecutor(TREE_CONCURRENCY) as ex:
+            rows = list(ex.map(inspect, rest))
+        for wt, m in rows:
+            memo['trees'][wt['path']] = m
+        live = {w['path'] for w in rest}
+        for path in [p for p in memo['trees'] if p not in live]:
+            del memo['trees'][path]
+
+        # Disk sizes, only for cleanup candidates, a few per refresh and none while opening.
+        trees, measured, pending = [], 0, False
+        for wt, m in rows:
+            age_min = max(0, int((now - m['committed_at']) // 60)) if m['committed_at'] > 0 else -1
+            unknown = m['ahead'] < 0 or m['dirty'] < 0
+            # Not knowing when a worktree was created counts as new: the safe answer.
+            is_new = not unknown and m['ahead'] == 0 and m['dirty'] == 0 and (m['touched_at'] == 0 or now - m['touched_at'] < NEW_S)
+            candidate = not unknown and (age_min >= OLD_MIN or (m['ahead'] == 0 and m['dirty'] == 0 and not is_new))
+            if not candidate:
+                m['size_mb'], m['size_at'] = None, 0
+            elif now - m['size_at'] >= SIZE_EVERY:
+                if force or measured >= SIZES_PER_TICK:
+                    pending = True
+                else:
+                    measured += 1
+                    mb = du_mb(wt['path'])
+                    m['size_mb'], m['size_at'] = (mb if mb is not None else m['size_mb']), now
+            trees.append({'path': wt['path'], 'branch': wt['branch'], 'age_min': age_min, 'size_mb': m['size_mb'],
+                          'dirty': m['dirty'], 'ahead': m['ahead'], 'is_new': is_new})
+
+        # Folders under .claude/worktrees that git no longer lists: the truly orphaned ones.
+        d = f"{main['path']}/.claude/worktrees"
+        folders = sorted(n for n, is_dir, _ in ls(d) if is_dir and f'{d}/{n}' not in live)
+        leftovers = []
+        for n in folders:
+            path = f'{d}/{n}'
+            e = memo['leftovers'].get(path) or {'size_mb': None, 'size_at': 0}
+            if now - e['size_at'] >= SIZE_EVERY:
+                if force or measured >= SIZES_PER_TICK:
+                    pending = True
+                else:
+                    measured += 1
+                    mb = du_mb(path)
+                    e = {'size_mb': mb if mb is not None else e['size_mb'], 'size_at': now}
+            memo['leftovers'][path] = e
+            leftovers.append({'name': n, 'path': path, 'size_mb': e['size_mb']})
+        for path in [p for p in memo['leftovers'] if p not in {f'{d}/{n}' for n in folders}]:
+            del memo['leftovers'][path]
+
+        if force or not memo['deploy'] or main['head'] != memo['main_head'] or upstream != memo['upstream']:
+            uc, uo = run(['git', 'log', '-n', str(COMMITS_CAP), '--format=%ct%x09%h%x09%s', f'{base}@{{u}}..{base}'], main['path'])
+            bc, bo = run(['git', 'rev-list', '--count', f'{base}..{base}@{{u}}'], main['path'])
+            nc, no = run(['git', 'rev-parse', '--abbrev-ref', f'{base}@{{u}}'], main['path'])
+            commits = []
+            for line in (uo.split('\n') if uc == 0 else []):
+                if line:
+                    parts = line.split('\t')
+                    commits.append({'at': num(parts[0]) or 0, 'hash': parts[1] if len(parts) > 1 else '', 'subject': '\t'.join(parts[2:])})
+            memo['deploy'] = {'branch': base, 'upstream': (nc == 0 and no.strip()) or f'origin/{base}', 'commits': commits,
+                              'behind': (num(bo) or 0) if bc == 0 else 0, 'has_upstream': uc == 0}
+
+        memo.update(sig=sig, main_head=main['head'], upstream=upstream, sizes_pending=pending)
+        if status_due:
+            memo['status_at'] = now
+        return {'trees': sorted(trees, key=lambda t: -t['age_min']), 'leftovers': leftovers, 'deploy': memo['deploy']}
+
+    # ----- sessions -----
+
+    def load_jobs(self, now):
+        if now - self.jobs_at < JOBS_EVERY:
+            return
+        root = f'{self.home}/.claude/jobs' if self.home else ''
+        dirs = [n for n, is_dir, _ in ls(root) if is_dir] if root else []
+        for name in dirs:
+            self.load_job(root, name, now)
+        names = set(dirs)
+        for name in [n for n in self.by_dir if n not in names]:
+            v = self.by_dir.pop(name)
+            self.scans.pop(v['path'], None)
+            self.models.pop(v['path'], None)
+            self.work_start.pop(name, None)
+        # Forget agent files nothing has looked at for an hour.
+        for memo in (self.agent_meta, self.agent_scan):
+            for k in [k for k, v in memo.items() if now - v['seen_at'] > 3600]:
+                del memo[k]
+        jobs = [v['job'] for v in self.by_dir.values()]
+        self.view = {
+            # Longest waiting first; completed ones, most recent first.
+            'needs': sorted((j for j in jobs if j['status'] in ('yours', 'failed')), key=lambda j: j['since']),
+            'working': sorted((j for j in jobs if j['status'] == 'working'), key=lambda j: j['since']),
+            'completed': sorted((j for j in jobs if j['status'] == 'done' and now - j['since'] < DAY), key=lambda j: -j['since']),
+        }
+        self.jobs_at = now
+
+    def load_job(self, root, name, now):
+        known = self.by_dir.get(name)
+        # A session that finished over a day ago is looked at every few minutes, not every refresh.
+        if known and known['is_old'] and now - known['at'] < OLD_RECHECK:
+            return
+        # A session that is not working and whose transcript has not moved has not changed: one stat, not a read.
+        if known and known['job']['status'] != 'working' and known['path'] and known['mtime'] > 0 and now - known['at'] < 30:
+            if mtime(known['path']) == known['mtime']:
+                return
+        try:
+            with open(f'{root}/{name}/state.json') as f:
+                j = json.load(f)
+        except (OSError, ValueError):
+            return
+        if not isinstance(j, dict):
+            return
+
+        terminal = j.get('lastTerminalAt') if j.get('lastTerminalAt') is not None else j.get('updatedAt')
+        finished = parse_ts(terminal) or now
+        # Anything the record doesn't name is working; tempo "active" beats done and blocked.
+        status = {'blocked': 'yours', 'done': 'done', 'failed': 'failed'}.get(j.get('state'), 'working')
+        if status in ('done', 'yours') and j.get('tempo') == 'active':
+            status = 'working'
+        since, since_set = finished, False
+        detail = j.get('needs') if j.get('needs') is not None else j.get('detail')
+        detail = str(detail) if detail is not None else ''
+        path = j.get('linkScanPath') if isinstance(j.get('linkScanPath'), str) else ''
+        old_done = status == 'done' and now - finished > DAY
+        idle_working = status == 'working' and j.get('tempo') == 'idle'
+        may_have_reply = status in ('done', 'yours') and j.get('tempo') != 'active' and not old_done
+        # One stat per session per check; the transcript itself is read only after it has changed.
+        mt = mtime(path) if path and not old_done else 0
+
+        if mt > 0 and (idle_working or may_have_reply):
+            seen = self.scans.get(path)
+            if (not seen or seen['mtime'] != mt) and (idle_working or (mt > finished and now - mt < 600)):
+                t = parse_tail(tail(path, 16384))
+                seen = {'mtime': mt, 'halted': t['halted'], 'reply': t['reply'], 'last_is_text': t['last_is_text']}
+                self.scans[path] = seen
+            if seen and idle_working and seen['halted']:
+                status, since = 'yours', seen['halted']
+                detail = 'Interrupted · what should Claude do instead?'
+            elif seen and may_have_reply and seen['reply'] > finished and now - seen['reply'] < 600:
+                status, since, since_set = 'working', seen['reply'], True
+
+        flags = j.get('respawnFlags') if isinstance(j.get('respawnFlags'), list) else []
+        alias = str(flags[flags.index('--model') + 1]) if '--model' in flags and flags.index('--model') + 1 < len(flags) else ''
+        family = alias.lower()
+        cwd = ''
+        model = (known and known['job']['model']) or self.learned.get(family) or (pretty_model(alias) if alias else '')
+        if mt > 0:
+            m = self.models.get(path)
+            if not m or (now - m['at'] > 60 and m['mtime'] != mt):
+                # One read of the transcript's end gives both the model and where the session's shell is now.
+                def find(n):
+                    text = tail(path, n)
+                    t = parse_tail(text)
+                    return {'ids': re.findall(r'"model":\s*"(claude-[a-z0-9-]+)"', text),
+                            'cwds': re.findall(r'"cwd":\s*"([^"]+)"', text), 'prompt_at': t['reply'], 'tree': t['tree']}
+                small = find(32768)
+                # Big tool outputs can push the last model name, or the last `cd` into a worktree, out of a small
+                # window: look wider once. After that the worktree is remembered, so a session that never uses
+                # one does not cost a wide read every minute.
+                wide = small if small['ids'] and small['cwds'] and (small['tree'] or m) else find(262144)
+                found_name = pretty_model(wide['ids'][-1]) if wide['ids'] else (m['name'] if m else '')
+                # A worktree seen in either window, or remembered from an earlier read, wins over the main checkout.
+                where = small['tree'] or wide['tree'] or (m['cwd'] if m and is_tree(m['cwd']) else None)
+                if where is None:
+                    where = small['cwds'][-1] if small['cwds'] else wide['cwds'][-1] if wide['cwds'] else (m['cwd'] if m else '')
+                if found_name:
+                    self.learned[found_name.split(' ')[0].lower()] = found_name
+                self.models[path] = {'at': now, 'mtime': mt, 'name': found_name, 'cwd': where,
+                                     'prompt_at': small['prompt_at'] or wide['prompt_at']}
+            model = self.models[path]['name'] or self.learned.get(family) or model
+            cwd = self.models[path]['cwd'] or ''
+        # A session isolated with EnterWorktree names its worktree in the record: no guessing needed.
+        if isinstance(j.get('worktreePath'), str) and j['worktreePath']:
+            cwd = j['worktreePath']
+        # Last resort: the directory the session was launched in.
+        if not cwd and isinstance(j.get('cwd'), str):
+            cwd = j['cwd']
+
+        agents = self.agents_of(path, now) if status == 'working' and path.endswith('.jsonl') else []
+
+        # Idle with nothing running, a finished message from Claude as the last word, and quiet for a minute:
+        # it is waiting for the person, whatever the record still says.
+        if idle_working and status == 'working' and not agents and mt > 0 and now - mt >= QUIET:
+            fl = j.get('inFlight') if isinstance(j.get('inFlight'), dict) else {}
+            if not (fl.get('tasks') or 0) and not (fl.get('queued') or 0) and (self.scans.get(path) or {}).get('last_is_text'):
+                status, since = 'yours', mt
+
+        # A working session has been since its last prompt, or failing that since it was first seen working.
+        if status == 'working':
+            if not since_set:
+                prompt_at = (self.models.get(path) or {}).get('prompt_at') or 0
+                since = prompt_at if prompt_at > 0 and prompt_at >= finished else self.work_start.get(name, now)
+            self.work_start[name] = since
+        else:
+            self.work_start.pop(name, None)
+
+        # Quiet for over a day and not working: looked at every few minutes, the first look spread at random
+        # so a long history is not all re-read at the same moment.
+        quiet_old = status != 'working' and now - finished > DAY
+        self.by_dir[name] = {
+            'job': {'id': name, 'name': str(j.get('name') or name), 'model': model, 'cwd': cwd, 'agents': agents,
+                    'detail': detail, 'status': status, 'since': since},
+            'at': now - random.random() * OLD_RECHECK if quiet_old and not known else now,
+            'is_old': quiet_old, 'path': path, 'mtime': mt,
+        }
+
+    def agents_of(self, path, now):
+        """Agents the session has running: a folder listing, then files only for those that changed."""
+        d = f"{path[:-len('.jsonl')]}/subagents"
+        files = ls(d)
+        by_name = {n: t for n, _, t in files}
+        live = sorted(((n, t) for n, _, t in files if n.endswith('.jsonl') and now - t <= AGENT_IDLE), key=lambda f: -f[1])[:12]
+        agents = []
+        for fname, ft in live:
+            aid = fname[:-len('.jsonl')]
+            meta_mtime = by_name.get(f'{aid}.meta.json')
+            if meta_mtime is None:
+                continue
+            meta_path = f'{d}/{aid}.meta.json'
+            meta = self.agent_meta.get(meta_path)
+            if not meta or meta['mtime'] != meta_mtime:
+                try:
+                    with open(meta_path) as f:
+                        raw = json.load(f)
+                    raw = raw if isinstance(raw, dict) else {}
+                    meta = {'mtime': meta_mtime, 'type': str(raw.get('agentType') or ''), 'description': str(raw.get('description') or ''),
+                            'model': str(raw.get('model') or ''), 'finished': raw.get('finished') is True}
+                except (OSError, ValueError):
+                    continue
+            meta['seen_at'] = now
+            self.agent_meta[meta_path] = meta
+            if meta['finished']:
+                continue
+            tail_path = f'{d}/{fname}'
+            scan = self.agent_scan.get(tail_path)
+            if not scan or (scan['mtime'] != ft and now - scan['at'] >= AGENT_SCAN_EVERY):
+                t = parse_tail(tail(tail_path, 16384), True)
+                prev = scan['cwd'] if scan else ''
+                where = t['cwd'] if is_tree(t['cwd']) else prev if is_tree(prev) else (t['cwd'] or prev)
+                scan = {'mtime': ft, 'at': now, 'halted': t['halted'] > 0, 'last_is_text': t['last_is_text'], 'cwd': where or ''}
+            scan['seen_at'] = now
+            self.agent_scan[tail_path] = scan
+            # The meta files never say "finished"; a final plain message that has gone quiet means it has.
+            if scan['halted'] or (scan['last_is_text'] and now - ft >= AGENT_DONE):
+                continue
+            model = (self.learned.get(meta['model'].lower()) or pretty_model(meta['model'])) if meta['model'] else ''
+            kind = meta['type'] if meta['type'] not in ('', 'general-purpose') else ''
+            agents.append({'id': aid, 'who': ' · '.join(x for x in (kind, model) if x) or 'agent',
+                           'description': meta['description'], 'since': meta_mtime, 'cwd': scan['cwd']})
+        return sorted(agents, key=lambda a: a['since'])
+
+    # ----- refreshing -----
+
+    def refresh(self, force=False):
+        """One refresh: git and sessions. A forced one is the opening, like /deck: its failure is the error."""
+        at = time.time()
+        failed = jobs_failed = False
+        error = None
+        try:
+            found = self.gather(at, force)
+        except Exception as e:  # recorded and shown, never fatal
+            found, failed, error = None, True, str(e)
+        try:
+            self.load_jobs(at)
+        except Exception as e:
+            jobs_failed, error = True, error or str(e)
+        done = time.time()
+        with self.lock:
+            if force and error:
+                self.snap = {'trees': [], 'leftovers': [], 'deploy': None, 'error': error, 'loading': False}
+            elif found:
+                self.snap = {**self.snap, **found, 'error': None, 'loading': False}
+            if force:
+                self.health = {'slow': 0, 'failed': False, 'jobs_failed': False, 'ok_at': at}
+            else:
+                self.health = {'slow': done - at if done - at >= SLOW else 0, 'failed': failed, 'jobs_failed': jobs_failed, 'ok_at': done}
+            self.ready = True
+
+    def run_forever(self, stop):
+        self.refresh(force=True)
+        while not stop.is_set():
+            self.refresh()
+            stop.wait(REFRESH)
+
+    def frame(self, p, now, cols):
+        with self.lock:
+            snap, health, ready = dict(self.snap), dict(self.health), self.ready
+        return frame_lines(p, snap, self.view, health, now, cols, ready)
+
+
+# ---------- drawing ----------
+
+def to256(r, g, b):
+    """The nearest xterm-256 index: the 6x6x6 cube or the grey ramp, whichever is closer."""
+    levels = (0, 95, 135, 175, 215, 255)
+    near = lambda v: min(range(6), key=lambda i: abs(levels[i] - v))
+    ci = tuple(near(v) for v in (r, g, b))
+    k = min(23, max(0, round(((r + g + b) / 3 - 8) / 10)))
+    dist = lambda c: sum((x - y) ** 2 for x, y in zip(c, (r, g, b)))
+    if dist((8 + 10 * k,) * 3) < dist(tuple(levels[i] for i in ci)):
+        return 232 + k
+    return 16 + 36 * ci[0] + 6 * ci[1] + ci[2]
+
+
+class Pen:
+    def __init__(self, colour, truecolor=False):
+        self.colour = colour
+        self.truecolor = truecolor
+
+    def __call__(self, text, hue=None, bold=False):
+        return (text, hue, bold)
+
+    def render(self, segs):
+        if not self.colour:
+            return ''.join(t for t, _, _ in segs)
+        s = ''
+        for t, h, b in segs:
+            if h:
+                r, g, bl = (int(h[i:i + 2], 16) for i in (1, 3, 5))
+                s += f'\x1b[38;2;{r};{g};{bl}m' if self.truecolor else f'\x1b[38;5;{to256(r, g, bl)}m'
+            if b:
+                s += '\x1b[1m'
+            s += t + ('\x1b[0m' if h or b else '')
+        return s
+
+
+def width_of(segs):
+    return sum(len(t) for t, _, _ in segs)
+
+
+def fit(left, width, right=None):
+    """One row of `width` cells, as Ink lays it out: `left` truncated at the end with …, then `right`
+    (when given) flush right after a gap of three."""
+    rw = width_of(right) if right is not None else 0
+    room = max(1, width - (rw + 3 if right is not None else 0))
+    if width_of(left) > room:
+        keep, kept = room - 1, []
+        for t, h, b in left:
+            if keep <= 0:
+                break
+            kept.append((t[:keep], h, b))
+            keep -= len(t[:keep])
+        left = kept + [('…', kept[-1][1] if kept else None, False)]
+    return left + [(' ' * max(0, width - width_of(left) - rw), None, False)] + (right or [])
+
+
+def wrap(text, width):
+    """Ink's wrap: words onto lines of `width`, the text's own line breaks kept."""
+    out = []
+    for par in text.split('\n'):
+        out += textwrap.wrap(par, max(8, width)) or ['']
+    return out
+
+
+def box(p, rows, w, hue=None):
+    """A round-bordered card, two cells of padding each side, the rows already `w - 6` wide."""
+    hue = hue or C['faint']
+    return ([[p('╭' + '─' * (w - 2) + '╮', hue)]]
+            + [[p('│', hue), p('  ')] + r + [p('  '), p('│', hue)] for r in rows]
+            + [[p('╰' + '─' * (w - 2) + '╯', hue)]])
+
+
+def note(p, text, w, hue=None):
+    """An empty section still gets its card, so every section has the same shape."""
+    return box(p, [fit([p(l, hue or C['dim'])], w - 6) for l in wrap(text, w - 6)], w)
+
+
+def rule(p, title, hue, w, tail=''):
+    """Title, a line that fills the gap, then the counts at the right; a blank line above."""
+    fill = w - len(title) - 1 - (len(tail) + 1 if tail else 0)
+    return [[], [p(title + ' ', hue, True), p('─' * max(0, fill), C['faint'])] + ([p(' ' + tail, C['dim'])] if tail else [])]
+
+
+def frame_lines(p, s, view, health, now, cols, ready=True):
+    w = max(40, cols - 2)
+    inner = w - 6
+    trees, leftovers, deploy = s['trees'], s['leftovers'] or [], s['deploy']
+    needs, working, completed = view['needs'], view['working'], view['completed']
+    if health['failed']:
+        warn = 'git check failed · worktrees and commits may be out of date'
+    elif health['jobs_failed']:
+        warn = 'session check failed · sessions may be out of date'
+    elif health['slow'] > 0:
+        warn = f"slow refresh · {health['slow']:.1f}s"
+    elif health['ok_at'] > 0 and now - health['ok_at'] > STALE:
+        warn = f"not refreshed for {int(now - health['ok_at'])}s"
+    else:
+        warn = ''
+
+    # A session is "in" a worktree when its shell's directory is the worktree or inside it.
+    def tree_of(cwd):
+        return next((t for t in trees if cwd and (cwd == t['path'] or cwd.startswith(t['path'] + '/'))), None)
+
+    # Which worktrees are in use: the session's own shell and each agent's, over recent activity only.
+    # A session between turns reads done but still holds its worktree; the day limit lets it go.
+    in_use = set()
+    for j in needs + working + completed:
+        if j['status'] != 'working' and now - j['since'] >= DAY:
+            continue
+        for cwd in [j['cwd']] + [a['cwd'] for a in j['agents']]:
+            t = tree_of(cwd)
+            if t:
+                in_use.add(t['path'])
+    # What cleaning up would free: merged, clean, not brand new, not in use, size known; plus orphaned folders.
+    reclaim = (sum(t['size_mb'] or 0 for t in trees if t['ahead'] == 0 and t['dirty'] == 0 and not t['is_new'] and t['path'] not in in_use)
+               + sum(l['size_mb'] or 0 for l in leftovers))
+    groups = [g for g in (('NEEDS INPUT', C['yours'], needs, 8), ('WORKING', C['working'], working, 8),
+                          ('COMPLETED', C['done'], completed, 3)) if g[2]]
+    beat = int(now / 0.5) % 2 == 0
+    pulse = C['working'] if beat else C['faint']
+    # A commit and its revert cancel out: both are marked.
+    subjects = {c['subject'] for c in deploy['commits']} if deploy else set()
+    reverted = set()
+    for c in deploy['commits'] if deploy else []:
+        sub = c['subject']
+        if sub.startswith('Revert "') and sub.endswith('"') and sub[8:-1] in subjects:
+            reverted |= {sub, sub[8:-1]}
+
+    L = []
+    if s['error']:
+        L += [[p(l, C['failed'])] for l in wrap(f"⚠ {s['error']}", w)]
+    if warn:
+        L.append([p(cut(f'⚠ {warn}', w), C['yours'])])
+
+    L += rule(p, 'SESSIONS', C['text'], w, f'{len(working)} working · {len(needs)} needs input · {len(completed)} completed')
+    if not groups:
+        L += note(p, 'No sessions.' if ready else 'Reading…', w)
+    for label, hue, jobs, most in groups:
+        L += [[], [p(label, hue, True)]]
+        for j in jobs[:most]:
+            dot = pulse if j['status'] == 'working' else C[j['status']]
+            mark = '◆ ' if j['status'] == 'yours' else '● '
+            sec = now - j['since']
+            when = clock(sec) if j['status'] == 'working' else ago(sec) if j['status'] == 'done' else f'waiting {clock(sec)}'
+            t = tree_of(j['cwd'])
+            rows = [fit([p(mark, dot), p(j['name'], C['text'], True)] + ([p('  ' + j['model'], C['dim'])] if j['model'] else [])
+                        + ([p(f"  ⎇ {t['branch']}", C['dim'])] if t else []), inner, [p(when, C['dim'])])]
+            if j['detail'] and j['status'] != 'done':
+                text = j['detail'] if len(j['detail']) <= 240 else j['detail'][:237] + '…'
+                rows += [fit([p(l, C['soft'])], inner) for l in wrap(text, inner)]
+            if j['detail'] and j['status'] == 'done':
+                rows.append(fit([p(' '.join(j['detail'].split()), C['dim'])], inner))
+            if j['status'] == 'working' and j['agents']:
+                shown = j['agents'][:AGENT_MOST]
+                for i, a in enumerate(shown):
+                    last = i == len(shown) - 1 and len(j['agents']) <= AGENT_MOST
+                    where = tree_of(a['cwd'])
+                    rows.append(fit([p('└─ ' if last else '├─ ', C['faint']), p('● ', pulse), p(a['who'], C['soft'])]
+                                    + ([p('  ' + a['description'], C['dim'])] if a['description'] else [])
+                                    + ([p(f"  ⎇ {where['branch']}", C['dim'])] if where else []),
+                                    inner, [p(clock(now - a['since']), C['dim'])]))
+                if len(j['agents']) > AGENT_MOST:
+                    rows.append(fit([p(f"└─ +{len(j['agents']) - AGENT_MOST} more", C['dim'])], inner))
+            L += box(p, rows, w, dot if j['status'] in ('yours', 'failed') else C['faint'])
+        if len(jobs) > most:
+            L.append([p(f'  +{len(jobs) - most} more', C['dim'])])
+
+    L += rule(p, 'WORKTREES', C['text'], w, f"{len(trees)} open{f' · {size(reclaim)} reclaimable' if reclaim > 0 else ''}")
+    if not trees and not leftovers:
+        L += note(p, 'Reading…' if s['loading'] else 'No extra worktrees.', w)
+    else:
+        rows = []
+        for t in trees[:TREE_MOST]:
+            if t['ahead'] < 0 or t['dirty'] < 0:
+                work = 'status unknown'
+            elif t['dirty'] > 0:
+                work = f"{t['dirty']} uncommitted file{'' if t['dirty'] == 1 else 's'}"
+            elif t['ahead'] > 0:
+                work = f"{t['ahead']} commit{'' if t['ahead'] == 1 else 's'} to land"
+            else:
+                work = ''
+            # Just "in use", not who: the session's card already names its worktree.
+            if t['path'] in in_use:
+                state, hue = ' · '.join(x for x in (work, 'in use') if x), C['working']
+            elif work:
+                state, hue = work, C['dim'] if work == 'status unknown' else C['yours']
+            elif t['is_new']:
+                state, hue = 'new', C['dim']
+            else:
+                state, hue = 'merged · safe to remove', C['dim']
+            facts = f"{age(t['age_min'])} old" + (f" · {size(t['size_mb'])}" if t['size_mb'] is not None else '')
+            rows.append(fit([p('⎇ ', C['dim']), p(t['branch'], C['soft'], True), p('  ' + state, hue)], inner,
+                            [p(facts, C['yours'] if t['age_min'] >= OLD_MIN else C['dim'])]))
+        if len(trees) > TREE_MOST:
+            rows.append(fit([p(f'  +{len(trees) - TREE_MOST} more worktrees', C['dim'])], inner))
+        for l in leftovers[:LEFTOVER_MOST]:
+            rows.append(fit([p('⎇ ', C['dim']), p(l['name'], C['soft'], True), p('  leftover folder · safe to delete', C['dim'])], inner,
+                            [p(size(l['size_mb']) if l['size_mb'] is not None else '', C['dim'])]))
+        if len(leftovers) > LEFTOVER_MOST:
+            rows.append(fit([p(f'  +{len(leftovers) - LEFTOVER_MOST} more leftover folders', C['dim'])], inner))
+        L += box(p, rows, w)
+
+    if deploy:
+        commits = deploy['commits']
+        n = len(commits)
+        count = f"{f'{COMMITS_CAP}+' if n >= COMMITS_CAP else n} {'commit' if n == 1 else 'commits'}" if n else ''
+        L += rule(p, f"UNPUSHED ON {deploy['branch'].upper()}", C['yours'] if n else C['done'], w, count)
+        if not deploy['has_upstream']:
+            L += note(p, 'The main branch has no upstream to compare with.', w)
+        elif not n:
+            behind = f" · {deploy['behind']} behind, pull to catch up" if deploy['behind'] > 0 else ''
+            L += note(p, f'In sync with origin{behind}', w, C['done'])
+        else:
+            # Drawn like `git log --graph`: newest at the top with the branch on it, down to what is live.
+            rows = []
+            for i, c in enumerate(commits[:MOST]):
+                gone = c['subject'] in reverted
+                rows.append(fit([p('● ', C['faint'] if gone else C['yours']), p(c['hash'] + ' ', C['dim'])]
+                                + ([p(f"({deploy['branch']}) ", C['yours'])] if i == 0 else [])
+                                + [p(c['subject'], C['dim'] if gone else C['soft'])], inner,
+                                [p(('reverted · ' if gone else '') + f"{age(max(0, int((now - c['at']) // 60)))} ago", C['dim'])]))
+            if n > MOST:
+                rows.append(fit([p('┆ ', C['faint']), p(f"+{n - MOST}{'+' if n >= COMMITS_CAP else ''} more", C['dim'])], inner))
+            rows.append(fit([p('○ ', C['done']), p(f"({deploy['upstream']})", C['done']), p(' live', C['dim'])], inner))
+            L += box(p, rows, w)
+
+    return [[p(' ')] + l for l in L]  # the pane's one cell of padding each side
+
+
+# ---------- main ----------
+
+def scrolled(top, keys, page):
+    """The first line shown after `keys` arrive. The wheel arrives as SGR mouse reports (64 up,
+    65 down, plus 4/8/16 for held modifiers), or as arrows where mouse reporting is off. Past the
+    end is clamped when the frame is drawn."""
+    wheel = [int(b) & ~28 for b in re.findall(r'\x1b\[<(\d+);\d+;\d+[Mm]', keys)]
+    keys = re.sub(r'\x1b\[<[0-9;]*[Mm]', '', keys)  # clicks and drags move nothing
+    rest = re.sub(r'\x1b(\[[0-9;]*.|O.)', '', keys)  # the single keys, sequences removed
+    if any(k in keys for k in ('\x1b[H', '\x1b[1~')) or 'g' in rest:
+        return 0
+    if any(k in keys for k in ('\x1b[F', '\x1b[4~')) or 'G' in rest:
+        return 10 ** 9
+    down = keys.count('\x1b[B') + keys.count('\x1bOB') + rest.count('j')
+    up = keys.count('\x1b[A') + keys.count('\x1bOA') + rest.count('k')
+    pages = keys.count('\x1b[6~') + rest.count(' ') - keys.count('\x1b[5~') - rest.count('b')
+    notches = wheel.count(65) - wheel.count(64)
+    return max(0, top + down - up + pages * page + notches * WHEEL_LINES)
+
+
+def footer(p, top, view, total, cols):
+    """The key bar, in Laravel multiplex's style: each key bold grey with its action dimmer, three spaces
+    apart; where the view stands on the right. Scroll shows only when there is more to see; paging and
+    g G work too but are left off the bar."""
+    more = total > view
+    keys = ([('↑/↓', 'scroll')] if more else []) + [('q', 'quit')]
+    left = []
+    for i, (k, action) in enumerate(keys):
+        left += ([p('   ')] if i else []) + [p(k, '#888888', True), p(' ' + action, '#555555')]
+    below = total - top - view
+    right = [p(f'↓ {below} more', C['yours'])] if more and below > 0 else [p(f'↑ {top} above', C['dim'])] if more else []
+    return [p(' ')] + fit(left, max(1, cols - 2), right) + [p(' ')]
+
+
+def main(argv):
+    home = argv[argv.index('--home') + 1] if '--home' in argv[:-1] else os.path.expanduser('~')
+    deck = Deck(home, find_repo(argv, home))
+    once = '--once' in argv or not sys.stdout.isatty()
+    p = Pen(colour='--plain' not in argv and (sys.stdout.isatty() or '--color' in argv),
+            truecolor='--truecolor' in argv)
+
+    if once:
+        deck.refresh(force=True)
+        cols = int(argv[argv.index('--cols') + 1]) if '--cols' in argv[:-1] else shutil.get_terminal_size().columns
+        print('\n'.join(p.render(l) for l in deck.frame(p, time.time(), cols)))
+        return 0
+
+    import signal
+    import termios
+    import tty
+    # Closing the tab or a kill still restores the terminal: exit through the finally below.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda *_: sys.exit(0))
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd) if sys.stdin.isatty() else None
+    out = sys.stdout
+    # Own screen, no cursor, and wheel reports (SGR) so scrolling works whatever the terminal's
+    # alternate-scroll setting; selecting text then takes Option (iTerm2) or Fn (Terminal.app).
+    mouse = '--no-mouse' not in argv
+    out.write('\x1b[?1049h\x1b[?25l' + ('\x1b[?1000h\x1b[?1006h' if mouse else ''))
+    # Git and the session records are read in the background; the screen redraws from what was last read.
+    stop = threading.Event()
+    threading.Thread(target=deck.run_forever, args=(stop,), daemon=True).start()
+    try:
+        if saved:
+            tty.setcbreak(fd)
+        top = 0
+        me = os.path.realpath(__file__)
+        born = os.stat(me).st_mtime
+        while True:
+            # An edit to this file restarts it in place: same tab, new code, no manual restart.
+            try:
+                if os.stat(me).st_mtime != born:
+                    if saved:
+                        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+                    os.execv(sys.executable, [sys.executable, me] + argv)
+            except OSError:
+                pass
+            cols, height = shutil.get_terminal_size()
+            lines = deck.frame(p, time.time(), cols)
+            # The deck scrolls between the top and the key bar, which keeps the bottom row with a gap above it.
+            # One row is left unused so the last newline never scrolls the screen.
+            view = max(1, height - 3)
+            total = len(lines)
+            top = max(0, min(top, total - view))
+            body = lines[top:top + view]
+            lines = body + [[]] * (view - len(body)) + [[], footer(p, top, view, total, cols)]
+            out.write('\x1b[H' + '\x1b[K\n'.join(p.render(l) for l in lines) + '\x1b[K\x1b[J')
+            out.flush()
+            ready, _, _ = select.select([sys.stdin] if saved else [], [], [], FRAME)
+            if ready:
+                keys = os.read(fd, 1024).decode(errors='ignore')
+                if 'q' in keys or 'Q' in keys:
+                    return 0
+                top = scrolled(top, keys, max(1, view - 2))
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        stop.set()
+        if saved:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        out.write(('\x1b[?1006l\x1b[?1000l' if mouse else '') + '\x1b[?25h\x1b[?1049l')
+        out.flush()
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

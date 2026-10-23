@@ -17,5 +17,9 @@ RUN npm install -g --prefix /out/usr/local "ccstatusline@${CCSTATUSLINE_VERSION}
 COPY files/settings.json files/ccstatusline.json /out/usr/local/share/claude-config/
 COPY --chmod=755 files/statusline /out/usr/local/bin/claude-config-statusline
 
+# The session monitor: one stdlib-only Python file, run on the workload's
+# python3, which the descriptor requires. Its tests live in tests/.
+COPY --chmod=755 files/session-deck /out/usr/local/bin/session-deck
+
 FROM scratch
 COPY --from=build /out /

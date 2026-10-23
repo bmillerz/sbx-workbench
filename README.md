@@ -10,7 +10,8 @@ kits/workbench-laravel/        set: laravel-base + Claude Code + Playwright   �
 kits/workbench-wordpress/      set: wordpress-base + Claude Code + Playwright ← or this
 kits/workbench-laravel-base/   workload: PHP 8.5, Composer, Postgres, Redis, sqlite
 kits/workbench-wordpress-base/ workload: PHP 8.5, Apache, MariaDB, Redis, Composer, wp-cli
-kits/claude-config/            mixin: prefs, ccstatusline, CLAUDE.md style rules
+kits/claude-config/            mixin: prefs, ccstatusline, CLAUDE.md style rules, session-deck
+tests/                         plain Python scripts, kept out of the kits' build contexts
 ```
 
 How the pieces divide, following Docker's own kits:
@@ -37,7 +38,7 @@ agent: workbench-laravel        # a set's agent name is its repository name
 workspace: .
 kits:
   - docker.io/bmillerz/workbench-laravel:2.0.1
-  - docker.io/bmillerz/claude-config:2.0.0
+  - docker.io/bmillerz/claude-config:2.1.0
 ports:
   - sandbox: 8000
     host: 8000
@@ -85,6 +86,42 @@ can't change the host-side commands a later run executes. sbx mounts the file
 read-only into the sandbox and this one declares no host commands, so keeping it
 in the project is a judgment call — move it out if you add `lifecycle:` or
 `command:` secrets.
+
+## Session deck
+
+`claude-config` installs `session-deck` at `/usr/local/bin`: a full-screen,
+read-only monitor of the sandbox's Claude Code sessions (needs input,
+working, completed, with their running subagents), the repo's worktrees
+(in use, uncommitted, merged and safe to remove, reclaimable space) and the
+main branch's unpushed commits. It's a terminal port of the deck plugin's
+pane: one stdlib-only Python file on the workload's `python3`, which the
+kit declares as `requires: deb/python3` so a workload without it fails at create.
+
+Run it from the Mac, in the project folder, in a tab of its own:
+
+```
+sbx env exec -it -- session-deck --repo "$PWD"
+```
+
+The workspace mounts at the same path inside the sandbox, so the Mac's
+`$PWD` names the right repository. `q` quits; scroll with the wheel, ↑↓ or
+j k. `session-deck --once --plain` prints one frame and exits, and the
+file's header lists the rest (`--truecolor`, `--no-mouse`, `--home`).
+
+The image holds a copy, so an edit to
+`kits/claude-config/files/session-deck` reaches a sandbox only through a
+version bump, `./publish.sh claude-config` and a recreated sandbox. To try a
+change in a running one, stream it into the agent's home instead:
+
+```
+sbx env exec -i -- sh -c 'cat > ~/session-deck && chmod +x ~/session-deck' \
+  < kits/claude-config/files/session-deck
+sbx env exec -it -- ~/session-deck --repo "$PWD"   # from the project folder
+```
+
+A running deck restarts itself when its own file changes, so re-streaming
+updates an open one in place. Tests: `python3 -I tests/test_session_deck.py`
+(prints `ok`; needs git).
 
 ## Plugins, MCP and skills
 

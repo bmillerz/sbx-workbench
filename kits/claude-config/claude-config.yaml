@@ -5,21 +5,23 @@ displayName: Claude Code config
 description: >-
   Carries the host's Claude Code preferences into a sandbox: a ccstatusline
   status line (alongside sbx Desktop's, not instead of it), settings and
-  global communication-style instructions. Merges into settings.json, so the
+  global communication-style instructions, plus session-deck, a terminal
+  monitor for the sandbox's sessions. Merges into settings.json, so the
   claude kit's own keys survive. Plugins aren't here: they live on the
   claude.ai account and sync into every session signed in to it.
 sourceUrl: https://github.com/bmillerz/sbx-workbench/tree/main/kits/claude-config
 
 # The kit's own release, and the tag it publishes under. Bump it when the
 # overlay or these declarations change — never rebuild a published tag.
-version: "2.0.0"
+version: "2.1.0"
 
 # `claude` orders this kit's install hook after the claude kit's, which
 # seeds settings.json from scratch on every create — merging before that
 # would be overwritten. `deb/jq` is derived from the workload's dpkg
-# database; the merge needs it. node (for ccstatusline) can't be required:
-# Ubuntu's nodejs version carries a `~`, so publishing drops deb/nodejs.
-requires: ["claude", "deb/jq"]
+# database; the merge needs it. `deb/python3` runs session-deck. node (for
+# ccstatusline) can't be required: Ubuntu's nodejs version carries a `~`,
+# so publishing drops deb/nodejs.
+requires: ["claude", "deb/jq", "deb/python3"]
 
 # No network-policy: the hook only reads files the overlay ships, and
 # ccstatusline renders locally.
