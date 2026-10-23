@@ -36,7 +36,7 @@ name: my-project
 agent: workbench-laravel        # a set's agent name is its repository name
 workspace: .
 kits:
-  - docker.io/bmillerz/workbench-laravel:2.0.0
+  - docker.io/bmillerz/workbench-laravel:2.0.1
   - docker.io/bmillerz/claude-config:2.0.0
 ports:
   - sandbox: 8000

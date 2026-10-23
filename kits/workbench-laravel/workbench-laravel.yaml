@@ -9,7 +9,7 @@ description: >-
 sourceUrl: https://github.com/bmillerz/sbx-workbench/tree/main/kits/workbench-laravel
 
 # The set's own release. Bump it whenever any pin below moves.
-version: "2.0.0"
+version: "2.0.1"
 
 args:
   # Where workbench-laravel-base was pushed. A build-phase arg, so a test
@@ -23,6 +23,6 @@ args:
 # Publishing pins each by digest. Order carries no meaning; the base's
 # `requires: ["claude"]` is what puts the claude mixin ahead of it.
 kits:
-  - ref: ${{ kit.args.registry }}/workbench-laravel-base:2.0.0
+  - ref: ${{ kit.args.registry }}/workbench-laravel-base:2.0.1
   - ref: docker.io/docker/sbx-kit-claude-mixin:2.1.292
   - ref: docker.io/docker/sbx-kit-playwright:1.61.1
