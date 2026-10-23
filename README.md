@@ -104,7 +104,10 @@ sbx env exec -it -- session-deck --repo "$PWD"
 ```
 
 The workspace mounts at the same path inside the sandbox, so the Mac's
-`$PWD` names the right repository. `q` quits; scroll with the wheel, ↑↓ or
+`$PWD` names the right repository — as long as you `cd`'d in with the right
+case. macOS doesn't care, Linux does: from `~/sites/my-project` the deck
+shows `⚠ git worktree list failed` and no worktrees or commits. Re-enter as
+`~/Sites/my-project`, or pass the path outright. `q` quits; scroll with the wheel, ↑↓ or
 j k. `session-deck --once --plain` prints one frame and exits, and the
 file's header lists the rest (`--truecolor`, `--no-mouse`, `--home`).
 
